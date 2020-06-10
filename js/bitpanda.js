@@ -441,35 +441,42 @@ module.exports = class bitpanda extends Exchange {
         if (granularity === undefined) {
             throw new ExchangeError (this.id + ' does not have the timeframe option: ' + timeframe);
         }
-        if (since === undefined) {
-            throw new ExchangeError (this.id + ' since needs to defined for OHLC');
-        }
         if (limit === undefined || limit > MAX_LIMIT) {
             limit = MAX_LIMIT;
         }
         const market = this.market (symbol);
         const duration = this.parseTimeframe (timeframe);
         // max time period in ms wrt granularity and limit
-        const maxTimePeriod = (limit - 1) * duration * 1000;
-        if ('to' in params) {
-            if (params['to'] <= this.sum (maxTimePeriod, since)) {
-                params['to'] = this.iso8601 (params['to']);
-            } else {
-                throw new ExchangeError (this.id + 'to parameter specified is too large');
-            }
-        } else {
-            // default to if none is specified
-            params['to'] = this.iso8601 (this.sum (maxTimePeriod, since));
+        const maxTimePeriod = limit * duration * 1000;
+        let to = this.milliseconds (); // default to if none is specified
+        if (since === undefined) {
+            // fetch MAX_LIMIT if no since is specified
+            since = to - maxTimePeriod;
         }
         const request = {
             'instrument': market['id'],
             'period': granularity['period'],
             'unit': granularity['unit'],
             'from': this.iso8601 (since),
-            'to': params['to'],
         };
-        const response = await this.publicGetCandlesticksInstrument (this.extend (request, params));
-        return this.parseOHLCVs (response, market, timeframe, since, limit);
+        if ('to' in params) {
+            if (this.parse8601 (params['to']) < since) {
+                throw new ExchangeError (this.id + ' since is after to parameter');
+            } else {
+                to = this.parse8601 (params['to']);
+            }
+        }
+        if (to >= this.sum (maxTimePeriod, since)) {
+            // Recursively load data chunk by chunk if exceeds MAX_LIMIT
+            request['to'] = this.iso8601 (this.sum (maxTimePeriod, since));
+            const response = await this.publicGetCandlesticksInstrument (request);
+            return this.parseOHLCVs (response, market, timeframe, since, limit)
+            + this.fetchOHLCV (symbol, timeframe, this.sum (maxTimePeriod + (duration * 1000), since), limit, params);
+        } else {
+            request['to'] = this.iso8601 (to);
+            const response = await this.publicGetCandlesticksInstrument (request);
+            return this.parseOHLCVs (response, market, timeframe, since, limit);
+        }
     }
 
     async fetchOpenOrders (symbol = undefined, since = undefined, limit = undefined, params = {}) {
