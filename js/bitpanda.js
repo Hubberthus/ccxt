@@ -449,6 +449,12 @@ module.exports = class bitpanda extends Exchange {
         // max time period in ms wrt granularity and limit
         const maxTimePeriod = limit * duration * 1000;
         let to = this.milliseconds (); // default to if none is specified
+        if ('to' in params) {
+            to = this.parse8601 (params['to']);
+            if (since !== undefined && to < since) {
+                throw new ExchangeError (this.id + ' since is after to parameter');
+            }
+        }
         if (since === undefined) {
             // fetch MAX_LIMIT if no since is specified
             since = to - maxTimePeriod;
@@ -459,13 +465,6 @@ module.exports = class bitpanda extends Exchange {
             'unit': granularity['unit'],
             'from': this.iso8601 (since),
         };
-        if ('to' in params) {
-            if (this.parse8601 (params['to']) < since) {
-                throw new ExchangeError (this.id + ' since is after to parameter');
-            } else {
-                to = this.parse8601 (params['to']);
-            }
-        }
         if (to >= this.sum (maxTimePeriod, since)) {
             // Recursively load data chunk by chunk if exceeds MAX_LIMIT
             request['to'] = this.iso8601 (this.sum (maxTimePeriod, since));
