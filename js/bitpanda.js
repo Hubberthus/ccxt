@@ -468,12 +468,12 @@ module.exports = class bitpanda extends Exchange {
         if (to >= this.sum (maxTimePeriod, since)) {
             // Recursively load data chunk by chunk if exceeds MAX_LIMIT
             request['to'] = this.iso8601 (this.sum (maxTimePeriod, since));
-            const response = await this.publicGetCandlesticksInstrument (request);
+            const response = await this.publicGetCandlesticksInstrument (this.extend (request, params));
             return this.parseOHLCVs (response, market, timeframe, since, limit)
             + this.fetchOHLCV (symbol, timeframe, this.sum (maxTimePeriod + (duration * 1000), since), limit, params);
         } else {
             request['to'] = this.iso8601 (to);
-            const response = await this.publicGetCandlesticksInstrument (request);
+            const response = await this.publicGetCandlesticksInstrument (this.extend (request, params));
             return this.parseOHLCVs (response, market, timeframe, since, limit);
         }
     }
