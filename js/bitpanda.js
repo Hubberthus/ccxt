@@ -170,6 +170,8 @@ module.exports = class bitpanda extends Exchange {
                 'MISSING_PERMISSION': PermissionDenied,
                 'ILLEGAL_CHARS': BadRequest,
                 'UNSUPPORTED_MEDIA_TYPE': BadRequest,
+                'ACCOUNT_HISTORY_TIME_RANGE_TOO_BIG': BadRequest,
+                'CANDLESTICKS_TIME_RANGE_TOO_BIG': BadRequest,
                 'INVALID_INSTRUMENT_CODE': BadRequest,
                 'INVALID_ORDER_TYPE': BadRequest,
                 'INVALID_UNIT': BadRequest,
@@ -184,6 +186,18 @@ module.exports = class bitpanda extends Exchange {
                 'INVALID_CURSOR': BadRequest,
                 'INVALID_ACCOUNT_ID': BadRequest,
                 'INVALID_SIDE': BadRequest,
+                'INVALID_ACCOUNT_HISTORY_FROM_TIME': BadRequest,
+                'INVALID_ACCOUNT_HISTORY_MAX_PAGE_SIZE': BadRequest,
+                'INVALID_ACCOUNT_HISTORY_TIME_PERIOD': BadRequest,
+                'INVALID_ACCOUNT_HISTORY_TO_TIME': BadRequest,
+                'INVALID_CANDLESTICKS_GRANULARITY': BadRequest,
+                'INVALID_CANDLESTICKS_UNIT': BadRequest,
+                'INVALID_ORDER_BOOK_DEPTH': BadRequest,
+                'INVALID_ORDER_BOOK_LEVEL': BadRequest,
+                'INVALID_PAGE_CURSOR': BadRequest,
+                'INVALID_TIME_RANGE': BadRequest,
+                'INVALID_TRADE_ID': BadRequest,
+                'INVALID_UI_ACCOUNT_SETTINGS': BadRequest,
                 'NEGATIVE_AMOUNT': BadRequest,
                 'NEGATIVE_PRICE': BadRequest,
                 'MIN_SIZE_NOT_SATISFIED': BadRequest,
@@ -192,9 +206,15 @@ module.exports = class bitpanda extends Exchange {
                 'BAD_TRIGGER_PRICE_PRECISION': BadRequest,
                 'MAX_OPEN_ORDERS_EXCEEDED': BadRequest,
                 'MISSING_PRICE': ArgumentsRequired,
-                'MISSING_INSTRUMENT_CODE': ArgumentsRequired,
                 'MISSING_ORDER_TYPE': ArgumentsRequired,
                 'MISSING_SIDE': ArgumentsRequired,
+                'MISSING_CANDLESTICKS_PERIOD_PARAM': ArgumentsRequired,
+                'MISSING_CANDLESTICKS_UNIT_PARAM': ArgumentsRequired,
+                'MISSING_FROM_PARAM': ArgumentsRequired,
+                'MISSING_INSTRUMENT_CODE': ArgumentsRequired,
+                'MISSING_ORDER_ID': ArgumentsRequired,
+                'MISSING_TO_PARAM': ArgumentsRequired,
+                'MISSING_TRADE_ID': ArgumentsRequired,
                 'INVALID_ORDER_ID': OrderNotFound,
                 'NOT_FOUND': OrderNotFound,
                 'INSUFFICIENT_LIQUIDITY': InsufficientFunds,
@@ -245,6 +265,7 @@ module.exports = class bitpanda extends Exchange {
     }
 
     async createOrder (symbol, type, side, amount, price = undefined, params = {}) {
+        await this.loadMarkets ();
         const request = {
             'instrument_code': this.marketId (symbol),
             'side': side.toUpperCase (),
@@ -389,45 +410,64 @@ module.exports = class bitpanda extends Exchange {
             market = this.market (symbol);
             request['instrument_code'] = market['id'];
         }
+        // from and to parameters are mutually inclusive
         if (since !== undefined) {
+            // we define now as default to parameter
+            let to = this.iso8601 (this.milliseconds ());
+            if ('to' in params) {
+                to = this.safeString (params, 'to');
+            }
+            request['to'] = to;
             request['from'] = this.iso8601 (since);
         }
         if (limit !== undefined) {
             request['max_page_size'] = limit;
         }
         const response = await this.privateGetAccountTrades (this.extend (request, params));
-        const tradeHistory = this.safeValue (response, 'trade_history');
-        const trades = [];
-        for (let i = 0; i < tradeHistory.length; i++) {
-            const trade = this.safeValue (tradeHistory[i], 'trade');
-            trades.push (trade);
+        const trades = this.safeValue (response, 'trade_history');
+        if ('cursor' in response) {
+            const cursor = this.safeValue (response, 'cursor');
+            return this.addPaginatorCursor (this.parseTrades (trades, market, since, limit, params), cursor);
         }
-        return this.parseTrades (trades, market, since, limit);
+        return this.parseTrades (trades, market, since, limit, params);
     }
 
     async fetchOHLCV (symbol, timeframe = '1m', since = undefined, limit = undefined, params = {}) {
+        // maximum supported by bitpanda pro
+        const MAX_LIMIT = 1000;
         await this.loadMarkets ();
-        const time = this.timeframes[timeframe];
-        if (time === undefined) {
+        const granularity = this.timeframes[timeframe];
+        // sanity checks
+        if (granularity === undefined) {
             throw new ExchangeError (this.id + ' does not have the timeframe option: ' + timeframe);
         }
-        const market = this.market (symbol);
-        const request = {
-            'instrument': market['id'],
-            'period': time['period'],
-            'unit': time['unit'],
-        };
         if (since === undefined) {
             throw new ExchangeError (this.id + ' since needs to defined for OHLC');
-        } else {
-            request['from'] = this.iso8601 (since);
         }
-        const to = this.safeInteger (params, 'to');
-        if (to === undefined) {
-            request['to'] = this.iso8601 (this.milliseconds ());
-        } else {
-            request['to'] = this.iso8601 (to);
+        if (limit === undefined || limit > MAX_LIMIT) {
+            limit = MAX_LIMIT;
         }
+        const market = this.market (symbol);
+        const duration = this.parseTimeframe (timeframe);
+        // max time period in ms wrt granularity and limit
+        const maxTimePeriod = (limit - 1) * duration * 1000;
+        if ('to' in params) {
+            if (params['to'] <= this.sum (maxTimePeriod, since)) {
+                params['to'] = this.iso8601 (params['to']);
+            } else {
+                throw new ExchangeError (this.id + 'to parameter specified is too large');
+            }
+        } else {
+            // default to if none is specified
+            params['to'] = this.iso8601 (this.sum (maxTimePeriod, since));
+        }
+        const request = {
+            'instrument': market['id'],
+            'period': granularity['period'],
+            'unit': granularity['unit'],
+            'from': this.iso8601 (since),
+            'to': params['to'],
+        };
         const response = await this.publicGetCandlesticksInstrument (this.extend (request, params));
         return this.parseOHLCVs (response, market, timeframe, since, limit);
     }
@@ -442,8 +482,7 @@ module.exports = class bitpanda extends Exchange {
             'id': id,
         };
         const response = await this.privateGetAccountOrdersId (this.extend (request, params));
-        const order = this.safeValue (response, 'order');
-        return this.parseOrder (order);
+        return this.parseOrder (response);
     }
 
     async fetchOrderBook (symbol, limit = undefined, params = {}) {
@@ -456,23 +495,37 @@ module.exports = class bitpanda extends Exchange {
 
     async fetchOrders (symbol = undefined, since = undefined, limit = undefined, params = {}) {
         await this.loadMarkets ();
-        const request = {
-            'with_cancelled_and_rejected': this.options['with_cancelled_and_rejected'],
-            'with_just_filled_inactive': this.options['with_just_filled_inactive'],
-        };
+        const request = {};
         let market = undefined;
         if (symbol !== undefined) {
             market = this.market (symbol);
             request['instrument_code'] = market['id'];
         }
+        // from and to parameters are mutually inclusive
         if (since !== undefined) {
+            // we define now as default to parameter
+            let to = this.iso8601 (this.milliseconds ());
+            if ('to' in params) {
+                to = this.safeString (params, 'to');
+            }
+            request['to'] = to;
             request['from'] = this.iso8601 (since);
         }
         if (limit !== undefined) {
             request['max_page_size'] = limit;
         }
+        if ('with_cancelled_and_rejected' in params) {
+            request['with_cancelled_and_rejected'] = this.safeString (params, 'with_cancelled_and_rejected');
+        }
+        if ('with_just_filled_inactive' in params) {
+            request['with_just_filled_inactive'] = this.safeString (params, 'with_just_filled_inactive');
+        }
         const response = await this.privateGetAccountOrders (this.extend (request, params));
         const orders = this.safeValue (response, 'order_history');
+        if ('cursor' in response) {
+            const cursor = this.safeValue (response, 'cursor');
+            return this.addPaginatorCursor (this.parseOrders (orders, market, since, limit, params), cursor);
+        }
         return this.parseOrders (orders, market, since, limit, params);
     }
 
@@ -490,9 +543,10 @@ module.exports = class bitpanda extends Exchange {
         await this.loadMarkets ();
         const response = await this.publicGetMarketTicker (params);
         const result = {};
-        for (let i = 0; i < response.length; i++) {
-            const instrument = this.safeString (response[i], 'instrument_code');
-            result[instrument] = this.parseTicker (response[i]);
+        const responseNum = response.length;
+        for (let i = 0; i < responseNum; i++) {
+            const symbol = this.translateSymbol (this.safeString (response[i], 'instrument_code'));
+            result[symbol] = this.parseTicker (response[i]);
         }
         return result;
     }
@@ -562,38 +616,98 @@ module.exports = class bitpanda extends Exchange {
             this.safeFloat (ohlcv, 'high'),
             this.safeFloat (ohlcv, 'low'),
             this.safeFloat (ohlcv, 'close'),
-            this.safeFloat (ohlcv, 'volume'),
+            // Bitpanda's volume is in quote currency we are using total_amount which is in base currency instead
+            this.safeFloat (ohlcv, 'total_amount'),
         ];
     }
 
     parseOrder (order, market = undefined) {
-        order = this.safeValue (order, 'order', order);
-        market = this.markets_by_id[this.safeString (order, 'instrument_code')];
-        const id = this.safeString (order, 'order_id');
-        const time = this.safeString (order, 'time');
-        const type = this.safeStringLower (order, 'type');
-        const side = this.safeStringLower (order, 'side');
-        const status = this.safeString (order, 'status');
-        const price = this.safeFloat (order, 'price');
-        const amount = this.safeFloat (order, 'amount');
-        const filled = this.safeFloat (order, 'filled_amount');
-        const cost = price * amount;
+        // example order response
+        // {
+        //   "order": {
+        //     "order_id": "66756a10-3e86-48f4-9678-b634c4b135b2",
+        //     "account_id": "1eb2ad5d-55f1-40b5-bc92-7dc05869e905",
+        //     "instrument_code": "BTC_EUR",
+        //     "amount": "1234.5678",
+        //     "filled_amount": "1234.5678",
+        //     "side": "BUY",
+        //     "type": "LIMIT",
+        //     "status": "OPEN",
+        //     "sequence": 123456789,
+        //     "price": "1234.5678",
+        //     "average_price": "1234.5678",
+        //     "reason": "INSUFFICIENT_FUNDS",
+        //     "time": "2020-05-06T06:53:31Z",
+        //     "time_in_force": "GOOD_TILL_CANCELLED",
+        //     "time_last_updated": "2020-05-06T06:53:31Z",
+        //     "expire_after": "2020-05-06T06:53:31Z",
+        //     "is_post_only": false,
+        //     "time_triggered": "2020-05-06T06:53:31Z",
+        //     "trigger_price": "1234.5678"
+        //   },
+        //   "trades": [
+        //     {
+        //       "trade": {
+        //         "trade_id": "2b42efcd-d5b7-4a56-8e12-b69ffd68c5ef",
+        //         "order_id": "66756a10-3e86-48f4-9678-b634c4b135b2",
+        //         "account_id": "c2d0076a-c20d-41f8-9e9a-1a1d028b2b58",
+        //         "amount": "1234.5678",
+        //         "side": "BUY",
+        //         "instrument_code": "BTC_EUR",
+        //         "price": "1234.5678",
+        //         "time": "2020-05-06T06:53:31Z",
+        //         "sequence": 123456789
+        //       },
+        //       "fee": {
+        //         "fee_amount": "1234.5678",
+        //         "fee_percentage": "1234.5678",
+        //         "fee_group_id": "default",
+        //         "running_trading_volume": "1234.5678",
+        //         "fee_currency": "BTC",
+        //         "fee_type": "TAKER"
+        //       }
+        //     }
+        //   ]
+        // }
+        const orderObject = this.safeValue (order, 'order', order);
+        const symbol = this.translateSymbol (this.safeString (orderObject, 'instrument_code'));
+        const id = this.safeString (orderObject, 'order_id');
+        const time = this.safeString (orderObject, 'time');
+        const timestamp = this.parse8601 (time);
+        const type = this.safeStringLower (orderObject, 'type');
+        const side = this.safeStringLower (orderObject, 'side');
+        const status = this.parseOrderStatus (this.safeString (orderObject, 'status'));
+        const price = this.safeFloat (orderObject, 'price');
+        const average = this.safeFloat (orderObject, 'average_price', 0);
+        const amount = this.safeFloat (orderObject, 'amount');
+        const filled = this.safeFloat (orderObject, 'filled_amount', 0);
+        // using average price which is actual filled price of the trades
+        const cost = average * amount;
         const remaining = amount - filled;
-        const fills = this.safeValue (order, 'fills');
+        const clientId = this.safeString (orderObject, 'client_id');
+        let trades = undefined;
+        // may not contain any trades if not filled
+        const fills = this.safeValue (order, 'trades');
+        if (fills !== undefined) {
+            trades = this.parseTrades (fills, market);
+        }
         return {
             'id': id,
             'datetime': time,
-            'timestamp': this.parse8601 (time),
+            'timestamp': timestamp,
             'status': status,
-            'symbol': market['symbol'],
+            'symbol': symbol,
             'type': type,
             'side': side,
             'price': price,
+            'average': average,
             'cost': cost,
+            'clientOrderId': clientId,
             'amount': amount,
             'filled': filled,
             'remaining': remaining,
-            'fills': fills,
+            'trades': trades,
+            // trades for one order can have multiple fee currencies, each trade contains this information of itself.
             'fee': undefined,
             'info': order,
         };
@@ -601,7 +715,7 @@ module.exports = class bitpanda extends Exchange {
 
     parseTicker (ticker) {
         const timestamp = this.milliseconds ();
-        const symbol = this.safeString (ticker, 'instrument_code');
+        const symbol = this.translateSymbol (this.safeString (ticker, 'instrument_code'));
         const last = this.safeFloat (ticker, 'last_price');
         return {
             'symbol': symbol,
@@ -609,9 +723,9 @@ module.exports = class bitpanda extends Exchange {
             'datetime': this.iso8601 (timestamp),
             'high': this.safeFloat (ticker, 'high'),
             'low': this.safeFloat (ticker, 'low'),
-            'bid': undefined,
+            'bid': this.safeFloat (ticker, 'best_bid'),
             'bidVolume': undefined,
-            'ask': undefined,
+            'ask': this.safeFloat (ticker, 'best_ask'),
             'askVolume': undefined,
             'vwap': undefined,
             'open': undefined,
@@ -627,26 +741,51 @@ module.exports = class bitpanda extends Exchange {
         };
     }
 
-    parseTrade (trade) {
-        const id = this.safeString (trade, 'trade_id');
-        const orderId = this.safeString (trade, 'order_id');
-        const time = this.safeString (trade, 'time');
-        const market = this.markets_by_id[this.safeString (trade, 'instrument_code')];
-        const side = this.safeString (trade, 'side');
-        const takerOrMaker = this.safeString (trade, 'fee_type');
-        const price = this.safeFloat (trade, 'price');
-        const amount = this.safeFloat (trade, 'amount');
+    parseTrade (trade, market = undefined) {
+        // Example Trade response
+        // {
+        //   "trade": {
+        //     "trade_id": "2b42efcd-d5b7-4a56-8e12-b69ffd68c5ef",
+        //     "order_id": "66756a10-3e86-48f4-9678-b634c4b135b2",
+        //     "account_id": "c2d0076a-c20d-41f8-9e9a-1a1d028b2b58",
+        //     "amount": "1234.5678",
+        //     "side": "BUY",
+        //     "instrument_code": "BTC_EUR",
+        //     "price": "1234.5678",
+        //     "time": "2020-05-06T06:53:31Z",
+        //     "sequence": 123456789
+        //   },
+        //   "fee": {
+        //     "fee_amount": "1234.5678",
+        //     "fee_percentage": "0.10",
+        //     "fee_group_id": "default",
+        //     "running_trading_volume": "1234.5678",
+        //     "fee_currency": "BTC",
+        //     "fee_type": "TAKER"
+        //   }
+        // }
+        const tradeObject = this.safeValue (trade, 'trade');
+        const feeObject = this.safeValue (trade, 'fee');
+        const id = this.safeString (tradeObject, 'trade_id');
+        const orderId = this.safeString (tradeObject, 'order_id');
+        const time = this.safeString (tradeObject, 'time');
+        const side = this.safeStringLower (tradeObject, 'side');
+        const takerOrMaker = this.safeStringLower (feeObject, 'fee_type');
+        const price = this.safeFloat (tradeObject, 'price');
+        const amount = this.safeFloat (tradeObject, 'amount');
         const cost = price * amount;
+        const symbol = this.translateSymbol (this.safeString (tradeObject, 'instrument_code'));
         const fee = {
-            'cost': this.safeFloat (trade, 'fee_amount'),
-            'currency': this.safeCurrencyCode (this.safeString (trade, 'fee_currency')),
+            'cost': this.safeFloat (feeObject, 'fee_amount'),
+            'currency': this.safeCurrencyCode (this.safeString (feeObject, 'fee_currency')),
+            'rate': this.safeFloat (feeObject, 'fee_percentage'),
         };
         return {
             'id': id,
             'info': trade,
             'datetime': time,
             'timestamp': this.parse8601 (time),
-            'symbol': market['symbol'],
+            'symbol': symbol,
             'type': undefined,
             'order': orderId,
             'side': side,
@@ -696,5 +835,46 @@ module.exports = class bitpanda extends Exchange {
             throw new this.exceptions[error] (error);
         }
         throw new ExchangeError (this.id + ' ' + this.json (response));
+    }
+
+    addPaginatorCursor (elements, cursor) {
+        if (cursor && elements) {
+            // php transpiler making problems here with array length, thus this specific hint.
+            const lastElement = elements.length;
+            elements[lastElement - 1]['info']['cursor'] = cursor;
+        }
+        return elements;
+    }
+
+    parseOrderStatus (status) {
+        const statuses = {
+            'OPEN': 'open',
+            'STOP_TRIGGERED': 'open',
+            'FILLED': 'open',
+            'FILLED_FULLY': 'closed',
+            'FILLED_CLOSED': 'canceled',
+            'FILLED_REJECTED': 'rejected',
+            'REJECTED': 'rejected',
+            'CLOSED': 'canceled',
+            'FAILED': 'failed',
+        };
+        return this.safeString (statuses, status, status);
+    }
+
+    translateSymbol (marketId) {
+        let symbol = undefined;
+        if (marketId !== undefined) {
+            if (marketId in this.markets_by_id) {
+                const market = this.markets_by_id[marketId];
+                symbol = market['symbol'];
+            } else {
+                // if not found we just parse it as the format is known
+                const [baseId, quoteId] = marketId.split ('_');
+                const base = this.safeCurrencyCode (baseId); // unified
+                const quote = this.safeCurrencyCode (quoteId);
+                symbol = base + '/' + quote;
+            }
+        }
+        return symbol;
     }
 };
